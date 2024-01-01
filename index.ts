@@ -5,9 +5,10 @@ let Pushover = require("node-pushover");
 let env = require("./env.json");
 
 class Notifier {
-  private logger: Logger = new Logger({ minLevel: "info" });
+  private logger: Logger = new Logger({ minLevel: env.general.log_level });
   private pushover;
   private currentPlayers: Array<string> = [];
+  private rcon: Rcon | undefined;
 
   constructor() {
     this.pushover = new Pushover({
@@ -20,11 +21,14 @@ class Notifier {
     ] = `Bearer ${env.smartthings.bearer_token}`;
   }
 
-  private async connect(): Promise<Rcon> {
+  private async connectRcon(): Promise<Rcon> {
+    this.logger.debug("Connecting to rcon...");
+
     return await Rcon.connect({
       host: env.rcon.host,
       port: env.rcon.port,
       password: env.rcon.password,
+      timeout: env.rcon.timeout,
     });
   }
 
@@ -35,23 +39,47 @@ class Notifier {
     );
   }
 
-  async run(): Promise<void> {
-    let rcon: Rcon;
+  private push(addedPlayers: string[]): void {
+    this.pushover.send(
+      `${addedPlayers.length} player(s) joined`,
+      addedPlayers.toString()
+    );
+  }
 
+  async run(): Promise<void> {
+    if (this.rcon === undefined) {
+      this.logger.debug("Rcon connection not established, connecting...");
+      try {
+        this.rcon = await this.connectRcon();
+        this.logger.debug("Rcon connection established");
+      } catch (err) {
+        this.logger.error("Could not establish rcon connection: ", err);
+        return;
+      }
+    }
+
+    let playerResp: string;
     try {
-      rcon = await this.connect();
-    } catch (e) {
-      this.logger.error("Connection failed: ", e);
+      playerResp = await this.rcon.send("list");
+    } catch (err) {
+      this.logger.error(
+        "Failed to receive list of players, resetting connection..."
+      );
+      this.rcon.end();
+      this.rcon = undefined;
+
       return;
     }
 
-    const resp = await rcon.send("list");
+    this.logger.debug("Received list of players: ", playerResp);
 
-    const newPlayerList = resp
-      .slice(resp.indexOf(":") + 2)
+    const newPlayerList = playerResp
+      .slice(playerResp.indexOf(":") + 2)
       .split(",")
-      .map((s) => s.trim());
-    this.logger.debug(newPlayerList);
+      .map((s) => s.trim())
+      .filter((s) => s !== "");
+
+    this.logger.debug("New players: ", newPlayerList);
 
     const addedPlayers = newPlayerList.filter(
       (p) => !this.currentPlayers.includes(p)
@@ -59,11 +87,14 @@ class Notifier {
 
     if (addedPlayers.length > 0) {
       this.logger.info("Added these players: ", addedPlayers);
-      this.pushover.send(
-        `${addedPlayers.length} player(s) joined`,
-        addedPlayers.toString()
-      );
-      // await this.ding();
+
+      if (env.general.push_on_join) {
+        this.push(addedPlayers);
+      }
+
+      if (env.general.ding_on_join) {
+        await this.ding();
+      }
     }
 
     const removedPlayers = this.currentPlayers.filter(
@@ -83,11 +114,18 @@ class Notifier {
     }
 
     this.currentPlayers = newPlayerList;
-
-    rcon.end();
   }
 }
 
 const notifier = new Notifier();
 
-setInterval((_) => notifier.run(), 5000);
+// first run
+notifier.run();
+
+setInterval((_) => {
+  try {
+    notifier.run();
+  } catch (error) {
+    console.error(error);
+  }
+}, env.general.interval_ms);
